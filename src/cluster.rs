@@ -1,18 +1,23 @@
-use crate::lnd::{LndClient, AddInvoiceResponse};
+use crate::lnd::{AddInvoiceResponse, LndClient};
 use anyhow::Result;
 use core::fmt;
-use serde::{Deserialize, Serialize};
-use std::{fmt::Display, ops::DerefMut};
+use moka::future::Cache;
 use rand::seq::SliceRandom;
+use serde::{Deserialize, Serialize};
+use std::{fmt::Display, time::Duration};
+use tokio::join;
+use futures::future::select_ok;
+
 pub struct Cluster {
     pub nodes: Vec<Node>,
     pub next_node_index: usize,
+    pub invoice_cache: Cache<String, ClusterLookupInvoice>,
 }
 
 pub struct Node {
     pub pubkey: String,
     pub ip: String,
-    pub port: i16,
+    pub port: String,
     pub network: NodeNetwork,
     pub lightning_impl: NodeLightningImpl,
     pub client: NodeClient,
@@ -54,7 +59,7 @@ pub struct ClusterAddInvoice {
     pub expiry: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ClusterLookupInvoice {
     pub pubkey: String,
     pub memo: String,
@@ -69,7 +74,7 @@ pub struct ClusterLookupInvoice {
     pub state: ClusterInvoiceState,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ClusterInvoiceState {
     #[serde(rename = "OPEN")]
     Open = 0,
@@ -92,8 +97,8 @@ impl Node {
                         let cluster_invoice = ClusterLookupInvoice {
                             pubkey: self.pubkey.clone(),
                             memo: invoice.memo,
-                            r_preimage: invoice.r_preimage,
-                            r_hash: invoice.r_hash,
+                            r_preimage: to_hex(&invoice.r_preimage)?,
+                            r_hash: String::from(r_hash),
                             value: invoice.value,
                             settle_date: invoice.settle_date,
                             payment_request: invoice.payment_request,
@@ -109,7 +114,7 @@ impl Node {
                 }
             }
             _ => {
-                panic!("Not implemented")
+                panic!("We only support LND nodes at this time.")
             }
         }
     }
@@ -121,13 +126,18 @@ impl Node {
 
                 match response {
                     Ok(invoice) => {
-                        Ok(invoice)
+                        let response = AddInvoiceResponse {
+                            r_hash: to_hex(&invoice.r_hash)?,
+                            payment_addr: to_hex(&invoice.payment_addr)?,
+                            ..invoice
+                        };
+                        Ok(response)
                     }
                     Err(err) => Err(err),
                 }
             }
             _ => {
-                panic!("Not implemented")
+                panic!("We only support LND nodes at this time.")
             }
         }
     }
@@ -135,9 +145,14 @@ impl Node {
 
 impl Cluster {
     pub fn new(nodes: Vec<Node>) -> Cluster {
-        Cluster {
+        let invoice_cache: Cache<String, ClusterLookupInvoice> = Cache::builder()
+            .time_to_live(Duration::from_secs(3))
+            .build();
+
+        Self {
             nodes,
             next_node_index: 0,
+            invoice_cache,
         }
     }
 
@@ -146,24 +161,52 @@ impl Cluster {
         r_hash: &str,
         pubkey: Option<String>,
     ) -> Result<ClusterLookupInvoice> {
-        if let Some(pubkey) = pubkey {
-            let node = self
-                .nodes
-                .iter()
-                .find(|node| node.pubkey == pubkey)
-                .unwrap();
-            node.lookup_invoice(r_hash).await
-        } else {
-            Err(anyhow::Error::msg("No pubkey provided"))
+        let cached_invoice = self.invoice_cache.get(&r_hash.to_string());
+    
+        match cached_invoice {
+            Some(invoice) => Ok(invoice),
+            None => {
+                if let Some(pubkey) = pubkey {
+                    let node = self
+                        .nodes
+                        .iter()
+                        .find(|node| node.pubkey == pubkey)
+                        .unwrap();
+                    let invoice = node.lookup_invoice(r_hash).await?;
+                    self.invoice_cache.insert(r_hash.to_string(), invoice.clone()).await;
+                    Ok(invoice)
+                } else {
+                    // Make calls to all nodes to find who owns the invoice
+                    let mut tasks = vec![];
+                    for node in &self.nodes {
+                        let r_hash_clone = r_hash.clone();
+                        let task = node.lookup_invoice(r_hash_clone);
+                        tasks.push(task);
+                    }
+    
+                    // Wait for all tasks to complete and find the first successful result
+                    let success_result = match futures::future::join_all(tasks).await.into_iter().enumerate().find_map(|(index, result)| result.ok()) {
+                        Some(success_result) => success_result,
+                        None => return Err(anyhow::Error::msg("No nodes found this invoice.")),
+                    };
+    
+                    // Insert the successful result into the cache
+                    self.invoice_cache
+                        .insert(r_hash.to_string(), success_result.clone())
+                        .await;
+                    
+                    Ok(success_result)
+                }
+            }
         }
     }
+    
 
     pub async fn add_invoice(
         &self,
         req: ClusterAddInvoice,
         pubkey: Option<String>,
     ) -> Result<AddInvoiceResponse> {
-        
         match pubkey {
             Some(pubkey) => {
                 let node = self
@@ -172,7 +215,7 @@ impl Cluster {
                     .find(|node| node.pubkey == pubkey)
                     .unwrap();
                 node.add_invoice(req).await
-            },
+            }
             None => {
                 let mut rng = rand::thread_rng();
                 let node = self.nodes.choose(&mut rng).unwrap();
@@ -180,14 +223,13 @@ impl Cluster {
             }
         }
     }
-
 }
 
 impl Node {
     pub fn new(
         pubkey: String,
         ip: String,
-        port: i16,
+        port: String,
         network: NodeNetwork,
         lightning_impl: NodeLightningImpl,
         client: NodeClient,
@@ -210,4 +252,11 @@ impl Display for NodeNetwork {
             NodeNetwork::Testnet => write!(f, "testnet"),
         }
     }
+}
+
+pub fn to_hex(str: &str) -> Result<String> {
+    let decoded_bytes = base64::decode(str)?;
+    let hex_string = hex::encode(decoded_bytes);
+
+    Ok(hex_string)
 }

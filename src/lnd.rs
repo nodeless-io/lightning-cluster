@@ -110,8 +110,6 @@ impl LndClient {
     }
 
     pub async fn lookup_invoice(&self, r_hash: &str) -> Result<LookupInvoiceResponse> {
-        let r_hash = decode_and_convert_to_hex(&r_hash)?;
-
         let url = format!("{}/v1/invoice/{}", self.host, r_hash);
         let response = LndClient::get(&url, &self.macaroon_path, &self.cert_path).await?;
 
@@ -186,11 +184,4 @@ impl LndClient {
 
         Ok(resp)
     }
-}
-
-fn decode_and_convert_to_hex(r_hash: &str) -> Result<String> {
-    let decoded_bytes = base64::decode(r_hash)?;
-    let hex_string = hex::encode(decoded_bytes);
-
-    Ok(hex_string)
 }
