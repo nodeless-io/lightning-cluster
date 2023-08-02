@@ -47,6 +47,25 @@ pub struct LookupInvoiceResponse {
     pub state: InvoiceState,
 }
 
+impl LookupInvoiceResponse {
+    pub fn to_cluster(self, pubkey: &str) -> cluster::ClusterLookupInvoice {
+        let state = self.state.to_cluster();
+        cluster::ClusterLookupInvoice {
+            pubkey: pubkey.to_string(),
+            memo: self.memo,
+            r_preimage: self.r_preimage,
+            r_hash: self.r_hash,
+            value: self.value,
+            settle_date: self.settle_date,
+            payment_request: self.payment_request,
+            description_hash: self.description_hash,
+            expiry: self.expiry,
+            amt_paid_sat: self.amt_paid_sat,
+            state: state,
+        }
+    }
+}
+
 #[derive(Deserialize, Debug)]
 pub enum InvoiceState {
     #[serde(rename = "OPEN")]

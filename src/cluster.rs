@@ -1,12 +1,12 @@
 use crate::lnd::{AddInvoiceResponse, LndClient};
 use anyhow::Result;
 use core::fmt;
+use futures::future::select_ok;
 use moka::future::Cache;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Display, time::Duration};
 use tokio::join;
-use futures::future::select_ok;
 
 pub struct Cluster {
     pub nodes: Vec<Node>,
@@ -39,16 +39,6 @@ pub enum NodeLightningImpl {
     CLightning,
     Eclair,
     Other,
-}
-
-pub struct ClusterError {
-    pub message: String,
-}
-
-impl Display for ClusterError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "ClusterError: {}", self.message)
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -90,28 +80,8 @@ impl Node {
     pub async fn lookup_invoice(self: &Self, r_hash: &str) -> Result<ClusterLookupInvoice> {
         match &self.client {
             NodeClient::Lnd(client) => {
-                let response = client.lookup_invoice(r_hash).await;
-
-                match response {
-                    Ok(invoice) => {
-                        let cluster_invoice = ClusterLookupInvoice {
-                            pubkey: self.pubkey.clone(),
-                            memo: invoice.memo,
-                            r_preimage: to_hex(&invoice.r_preimage)?,
-                            r_hash: String::from(r_hash),
-                            value: invoice.value,
-                            settle_date: invoice.settle_date,
-                            payment_request: invoice.payment_request,
-                            description_hash: invoice.description_hash,
-                            expiry: invoice.expiry,
-                            amt_paid_sat: invoice.amt_paid_sat,
-                            state: invoice.state.to_cluster(),
-                        };
-
-                        Ok(cluster_invoice)
-                    }
-                    Err(err) => Err(err),
-                }
+                let invoice = client.lookup_invoice(r_hash).await?;
+                Ok(invoice.to_cluster(&self.pubkey))
             }
             _ => {
                 panic!("We only support LND nodes at this time.")
@@ -122,19 +92,14 @@ impl Node {
     pub async fn add_invoice(self: &Self, req: ClusterAddInvoice) -> Result<AddInvoiceResponse> {
         match &self.client {
             NodeClient::Lnd(client) => {
-                let response = client.add_invoice(req).await;
+                let invoice = client.add_invoice(req).await?;
 
-                match response {
-                    Ok(invoice) => {
-                        let response = AddInvoiceResponse {
-                            r_hash: to_hex(&invoice.r_hash)?,
-                            payment_addr: to_hex(&invoice.payment_addr)?,
-                            ..invoice
-                        };
-                        Ok(response)
-                    }
-                    Err(err) => Err(err),
-                }
+                let response = AddInvoiceResponse {
+                    r_hash: to_hex(&invoice.r_hash)?,
+                    payment_addr: to_hex(&invoice.payment_addr)?,
+                    ..invoice
+                };
+                Ok(response)
             }
             _ => {
                 panic!("We only support LND nodes at this time.")
@@ -162,7 +127,7 @@ impl Cluster {
         pubkey: Option<String>,
     ) -> Result<ClusterLookupInvoice> {
         let cached_invoice = self.invoice_cache.get(&r_hash.to_string());
-    
+
         match cached_invoice {
             Some(invoice) => Ok(invoice),
             None => {
@@ -173,7 +138,9 @@ impl Cluster {
                         .find(|node| node.pubkey == pubkey)
                         .unwrap();
                     let invoice = node.lookup_invoice(r_hash).await?;
-                    self.invoice_cache.insert(r_hash.to_string(), invoice.clone()).await;
+                    self.invoice_cache
+                        .insert(r_hash.to_string(), invoice.clone())
+                        .await;
                     Ok(invoice)
                 } else {
                     // Make calls to all nodes to find who owns the invoice
@@ -183,24 +150,28 @@ impl Cluster {
                         let task = node.lookup_invoice(r_hash_clone);
                         tasks.push(task);
                     }
-    
+
                     // Wait for all tasks to complete and find the first successful result
-                    let success_result = match futures::future::join_all(tasks).await.into_iter().enumerate().find_map(|(index, result)| result.ok()) {
+                    let success_result = match futures::future::join_all(tasks)
+                        .await
+                        .into_iter()
+                        .enumerate()
+                        .find_map(|(index, result)| result.ok())
+                    {
                         Some(success_result) => success_result,
                         None => return Err(anyhow::Error::msg("No nodes found this invoice.")),
                     };
-    
+
                     // Insert the successful result into the cache
                     self.invoice_cache
                         .insert(r_hash.to_string(), success_result.clone())
                         .await;
-                    
+
                     Ok(success_result)
                 }
             }
         }
     }
-    
 
     pub async fn add_invoice(
         &self,

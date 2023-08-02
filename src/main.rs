@@ -1,10 +1,5 @@
 use cluster::{ClusterAddInvoice, Node, NodeClient, NodeLightningImpl, NodeNetwork};
 use lnd::LndClient;
-use moka::future::Cache;
-use std::time::Duration;
-use tokio::main;
-
-use crate::cluster::ClusterLookupInvoice;
 
 mod cluster;
 mod lnd;
@@ -36,25 +31,7 @@ async fn main() {
 
     let invoice = cluster.add_invoice(req, None).await.unwrap();
 
-    let mut i = 0;
+    let get_invoice = cluster.lookup_invoice(&invoice.r_hash, None).await.unwrap();
 
-    loop {
-        // measure how long each loop takes
-        let start = std::time::Instant::now();
-        let get_invoice = cluster
-        .lookup_invoice(&invoice.r_hash, None)
-        .await
-        .unwrap();
-
-        i = i + 1;
-
-        let elapsed = start.elapsed();
-
-        if elapsed > Duration::from_nanos(10000) {
-            break;
-        }
-
-        println!("cache hits: {}", i);
-
-    }
+    println!("{:?}", get_invoice);
 }
