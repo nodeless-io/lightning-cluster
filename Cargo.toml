@@ -18,3 +18,4 @@ rand = "0.8.4"
 moka = { version = "0.11", features = ["future"] }
 futures-util = "0.3"
 futures = "0.3"
+serde_with = "3.1.0"

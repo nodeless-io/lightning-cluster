@@ -7,6 +7,7 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Display, time::Duration};
 use tokio::join;
+use crate::lnd::{LndSendPaymentSyncReq, FeeLimit, Route, InvoiceState};
 
 pub struct Cluster {
     pub nodes: Vec<Node>,
@@ -64,6 +65,13 @@ pub struct ClusterLookupInvoice {
     pub state: ClusterInvoiceState,
 }
 
+pub struct ClusterPayPaymentRequestRes {
+    pub payment_error: Option<String>,
+    pub payment_preimage: Option<String>,
+    pub payment_route: Option<Route>,
+    pub payment_hash: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ClusterInvoiceState {
     #[serde(rename = "OPEN")]
@@ -94,12 +102,12 @@ impl Node {
             NodeClient::Lnd(client) => {
                 let invoice = client.add_invoice(req).await?;
 
-                let response = AddInvoiceResponse {
-                    r_hash: to_hex(&invoice.r_hash)?,
-                    payment_addr: to_hex(&invoice.payment_addr)?,
-                    ..invoice
-                };
-                Ok(response)
+                        let response = AddInvoiceResponse {
+                            r_hash: to_hex(&invoice.r_hash)?,
+                            payment_addr: to_hex(&invoice.payment_addr)?,
+                            ..invoice
+                        };
+                        Ok(response)
             }
             _ => {
                 panic!("We only support LND nodes at this time.")
@@ -138,10 +146,15 @@ impl Cluster {
                         .find(|node| node.pubkey == pubkey)
                         .unwrap();
                     let invoice = node.lookup_invoice(r_hash).await?;
+                    let hexed_invoice = ClusterLookupInvoice {
+                        r_hash: to_hex(&invoice.r_hash)?,
+                        r_preimage: to_hex(&invoice.r_preimage)?,
+                        ..invoice
+                    };
                     self.invoice_cache
-                        .insert(r_hash.to_string(), invoice.clone())
+                        .insert(r_hash.to_string(), hexed_invoice.clone())
                         .await;
-                    Ok(invoice)
+                    Ok(hexed_invoice)
                 } else {
                     // Make calls to all nodes to find who owns the invoice
                     let mut tasks = vec![];
@@ -162,12 +175,18 @@ impl Cluster {
                         None => return Err(anyhow::Error::msg("No nodes found this invoice.")),
                     };
 
+                    let hexed_invoice = ClusterLookupInvoice {
+                        r_hash: to_hex(&success_result.r_hash)?,
+                        r_preimage: to_hex(&success_result.r_preimage)?,
+                        ..success_result.clone()
+                    };
+
                     // Insert the successful result into the cache
                     self.invoice_cache
-                        .insert(r_hash.to_string(), success_result.clone())
+                        .insert(r_hash.to_string(), hexed_invoice.clone())
                         .await;
 
-                    Ok(success_result)
+                    Ok(hexed_invoice)
                 }
             }
         }
@@ -194,6 +213,42 @@ impl Cluster {
             }
         }
     }
+
+    // pub async fn pay_invoice(
+    //     &self, 
+    //     amount: u64, 
+    //     payment_request: String, 
+    //     pubkey: Option<String>) -> Result<ClusterPayPaymentRequestRes> {
+        
+    //     // node selected
+    //     if pubkey.is_some() {
+    //         let node = self
+    //             .nodes
+    //             .iter()
+    //             .find(|node| node.pubkey == pubkey.unwrap())
+    //             .unwrap();
+    //         match &node.client {
+    //             NodeClient::Lnd(client) => {
+    //                 let req = LndSendPaymentSyncReq {
+    //                     payment_request: payment_request.clone(),
+    //                     amt: amount.to_string(),
+    //                     fee_limit: FeeLimit {
+    //                         fixed: String::from("0"),
+    //                     },
+    //                     allow_self_payment: false,
+    //                 };
+    //                 let invoice = client.send_payment_sync(req).await?;
+    //                 Ok(invoice.to_cluster())
+    //             }
+    //             _ => {
+    //                 panic!("We only support LND nodes at this time.")
+    //             }
+    //         }
+    //     } else {
+    //         // no node selected
+    //     }
+    // }
+
 }
 
 impl Node {
@@ -230,4 +285,51 @@ pub fn to_hex(str: &str) -> Result<String> {
     let hex_string = hex::encode(decoded_bytes);
 
     Ok(hex_string)
+}
+
+#[cfg(test)]
+pub mod tests {
+    use crate::lnd::LndClient;
+
+    use super::{Cluster, Node, NodeNetwork, NodeLightningImpl, NodeClient, ClusterAddInvoice};
+
+
+    #[tokio::test]
+    async fn test_add_lookup_invoice() {
+        let cluster = create_test_cluster();
+        let add_invoice = ClusterAddInvoice {
+            pubkey: None,
+            memo: String::from("test"),
+            value: 1000,
+            expiry: 1000,
+        };
+        let invoice = cluster.add_invoice(add_invoice, None).await.unwrap();
+
+        assert_eq!(invoice.r_hash.len(), 64);
+        assert_eq!(invoice.payment_addr.len(), 64);
+
+        let lookup_invoice = cluster.lookup_invoice(&invoice.r_hash, None).await.unwrap();
+
+        assert_eq!(lookup_invoice.r_hash, invoice.r_hash);
+    }
+
+    pub fn create_test_cluster() -> Cluster {
+        let node1 = Node {
+            pubkey: dotenvy::var("NODE1_PUBKEY").unwrap(),
+            ip: dotenvy::var("NODE1_IP").unwrap(),
+            port: dotenvy::var("NODE1_PORT").unwrap(),
+            network: NodeNetwork::Testnet,
+            lightning_impl: NodeLightningImpl::Lnd,
+            client: NodeClient::Lnd(LndClient::new(
+                dotenvy::var("NODE1_HOST").unwrap(),
+                dotenvy::var("NODE1_CERT_PATH").unwrap(),
+                dotenvy::var("NODE1_MACAROON_PATH").unwrap(),
+            )),
+        };
+    
+        let nodes = vec![node1];
+        let cluster = Cluster::new(nodes);
+
+        cluster
+    }
 }
