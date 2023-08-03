@@ -722,6 +722,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4668fb0ea861c1df094127ac5f1da3409a82116a4ba74fca2e58ef927159bb3"
 
 [[package]]
+name = "lightning-cluster"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.13.1",
+ "dotenvy",
+ "futures",
+ "futures-util",
+ "hex",
+ "moka",
+ "rand",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "tokio",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -840,25 +859,6 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "tempfile",
-]
-
-[[package]]
-name = "node-cluster"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.13.1",
- "dotenvy",
- "futures",
- "futures-util",
- "hex",
- "moka",
- "rand",
- "reqwest",
- "serde",
- "serde_json",
- "serde_with",
- "tokio",
 ]
 
 [[package]]
