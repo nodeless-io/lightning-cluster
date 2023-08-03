@@ -1,5 +1,11 @@
 [package]
 name = "lightning-cluster"
+description = "Lightning Node Load Balancer & Cache"
+authors = ["utxo <crates@utxo.one>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nodeless-io/lightning-cluster"
+readme = "README.md"
+keywords = ["lightning", "cluster", "load-balancing", "cache", "bitcoin", "lnd", "clightning"]
 version = "0.1.0"
 edition = "2021"
 
