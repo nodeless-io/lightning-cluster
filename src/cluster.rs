@@ -1,13 +1,11 @@
 use crate::lnd::{AddInvoiceResponse, LndClient};
 use anyhow::Result;
 use core::fmt;
-use futures::future::select_ok;
 use moka::future::Cache;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Display, time::Duration};
-use tokio::join;
-use crate::lnd::{LndSendPaymentSyncReq, FeeLimit, Route, InvoiceState};
+use crate::lnd::Route;
 
 pub struct Cluster {
     pub nodes: Vec<Node>,
@@ -169,7 +167,7 @@ impl Cluster {
                         .await
                         .into_iter()
                         .enumerate()
-                        .find_map(|(index, result)| result.ok())
+                        .find_map(|(_index, result)| result.ok())
                     {
                         Some(success_result) => success_result,
                         None => return Err(anyhow::Error::msg("No nodes found this invoice.")),
