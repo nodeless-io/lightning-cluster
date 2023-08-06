@@ -4,8 +4,9 @@ use reqwest::Response;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Read;
-use crate::cluster::{self, ClusterAddInvoice};
+use crate::cluster::{self, ClusterAddInvoice, ClusterUtxos, ClusterUtxo};
 
+#[derive(Clone)]
 pub struct LndClient {
     pub host: String,
     pub cert_path: String,
@@ -22,6 +23,60 @@ pub struct AddInvoiceLndRequest {
     pub memo: String,
     pub value: u64,
     pub expiry: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ListUnspentRequest {
+    pub min_confs: u64,
+    pub max_confs: u64,
+    pub account: Option<String>,
+    pub unconfirmed_only: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ListUnspentResponse {
+    pub utxos: Vec<Utxo>,
+}
+
+impl ListUnspentResponse {
+    pub fn to_cluster(self, pubkey: String) -> Result<ClusterUtxos> {
+        let mut utxos = Vec::new();
+        for utxo in self.utxos {
+            utxos.push(utxo.to_cluster(pubkey.clone())?);
+        }
+
+        Ok(ClusterUtxos {
+            utxos: utxos,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Utxo {
+    pub address: String,
+    pub amount_sat: String,
+    pub confirmations: String,
+    pub outpoint: Outpoint,
+    pub pk_script: String,
+}
+
+impl Utxo {
+    pub fn to_cluster(self, pubkey: String) -> Result<ClusterUtxo> {
+        let amount = self.amount_sat.parse::<u64>()?;
+        Ok(ClusterUtxo {
+            pubkey: pubkey,
+            address: self.address,
+            amount: amount,
+            confirmations: self.confirmations.parse::<u64>()?,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Outpoint {
+    pub txid_bytes: String,
+    pub txid_str: String,
+    pub output_index: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -98,7 +153,7 @@ pub struct LndSendPaymentSyncRes {
     pub payment_hash: Option<String>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Route {
     pub total_time_lock: u64,
     pub total_fees: String,
@@ -106,7 +161,7 @@ pub struct Route {
     pub hops: Vec<Hop>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Hop {
     pub chan_id: String,
     pub chan_capacity: String,
@@ -120,8 +175,9 @@ pub struct Hop {
 }
 
 impl LndSendPaymentSyncRes {
-    pub fn to_cluster(self) -> cluster::ClusterPayPaymentRequestRes {
+    pub fn to_cluster(self, pubkey: String) -> cluster::ClusterPayPaymentRequestRes {
         cluster::ClusterPayPaymentRequestRes {
+            pubkey: pubkey,
             payment_error: self.payment_error,
             payment_preimage: self.payment_preimage,
             payment_route: self.payment_route,
@@ -196,12 +252,15 @@ impl LndClient {
         let res = LndClient::post(&self, &url, &req).await.unwrap();
 
         let json_string = res.text().await.unwrap();
+
+        eprintln!("{}", json_string);
+
         let json = serde_json::from_str::<serde_json::Value>(&json_string).unwrap();
 
         let payment_hash = match &json["payment_hash"] {
             serde_json::Value::Null => None,
             serde_json::Value::String(s) if s.is_empty() => None,
-            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::String(s) => Some(to_hex(&s)?),
             _ => None, 
         };
         
@@ -224,7 +283,7 @@ impl LndClient {
         let payment_preimage = match &json["payment_preimage"] {
             serde_json::Value::Null => None,
             serde_json::Value::String(s) if s.is_empty() => None,
-            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::String(s) => Some(to_hex(&s)?),
             _ => None,
         };
 
@@ -235,7 +294,28 @@ impl LndClient {
             payment_hash,
         };
 
+        eprintln!("{:?}", res);
+
         Ok(res)
+    }
+
+    pub async fn list_unspent(&self) -> Result<ListUnspentResponse> {
+        let url = format!("{}/v2/wallet/utxos", self.host);
+
+        let req = ListUnspentRequest {
+            min_confs: 0,
+            max_confs: 500,
+            account: None,
+            unconfirmed_only: None,
+        };
+        let response = LndClient::post(&self, &url, &req).await?;
+
+        let json = response
+            .json::<ListUnspentResponse>()
+            .await
+            .map_err(|error| anyhow::Error::from(error))?;
+
+        Ok(json)
     }
 
     async fn get(&self, url: &str) -> Result<Response> {
@@ -303,6 +383,13 @@ impl LndClient {
     }
 }
 
+pub fn to_hex(str: &str) -> Result<String> {
+    let decoded_bytes = base64::decode(str)?;
+    let hex_string = hex::encode(decoded_bytes);
+
+    Ok(hex_string)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::lnd::{LndClient, LndSendPaymentSyncReq, FeeLimit};
@@ -322,7 +409,7 @@ mod tests {
             payment_request: payment_request,
             amt: String::from("1000"),
             fee_limit: FeeLimit {
-                fixed: String::from("10"),
+                fixed: 10.to_string(),
             },
             allow_self_payment: true,
         };
