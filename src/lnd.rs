@@ -21,14 +21,14 @@ pub struct NewAddressResponse {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct AddInvoiceLndRequest {
     pub memo: String,
-    pub value: u64,
-    pub expiry: u64,
+    pub value: i64,
+    pub expiry: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ListUnspentRequest {
-    pub min_confs: u64,
-    pub max_confs: u64,
+    pub min_confs: i64,
+    pub max_confs: i64,
     pub account: Option<String>,
     pub unconfirmed_only: Option<bool>,
 }

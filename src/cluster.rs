@@ -50,8 +50,8 @@ pub enum NodeLightningImpl {
 pub struct ClusterAddInvoice {
     pub pubkey: Option<String>,
     pub memo: String,
-    pub value: u64,
-    pub expiry: u64,
+    pub value: i64,
+    pub expiry: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
