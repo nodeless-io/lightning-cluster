@@ -1,4 +1,4 @@
-use crate::lnd::{AddInvoiceResponse, LndClient};
+use crate::lnd::{AddInvoiceResponse, LndClient, LndSendPaymentSyncReq, FeeLimit};
 use anyhow::Result;
 use core::fmt;
 use moka::future::Cache;
@@ -11,8 +11,11 @@ pub struct Cluster {
     pub nodes: Vec<Node>,
     pub next_node_index: usize,
     pub invoice_cache: Cache<String, ClusterLookupInvoice>,
+    pub address_cache: Cache<String, String>,
+    pub utxo_cache: Cache<String, ClusterUtxos>,
 }
 
+#[derive(Clone)]
 pub struct Node {
     pub pubkey: String,
     pub ip: String,
@@ -22,17 +25,20 @@ pub struct Node {
     pub client: NodeClient,
 }
 
+#[derive(Clone)]
 pub enum NodeClient {
     Lnd(LndClient),
     CLightning,
     Eclair,
     Other,
 }
+#[derive(Clone)]
 pub enum NodeNetwork {
     Mainnet,
     Testnet,
 }
 
+#[derive(Clone)]
 pub enum NodeLightningImpl {
     Lnd,
     CLightning,
@@ -63,11 +69,26 @@ pub struct ClusterLookupInvoice {
     pub state: ClusterInvoiceState,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ClusterPayPaymentRequestRes {
+    pub pubkey: String,
     pub payment_error: Option<String>,
     pub payment_preimage: Option<String>,
     pub payment_route: Option<Route>,
     pub payment_hash: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct ClusterUtxos {
+    pub utxos: Vec<ClusterUtxo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClusterUtxo {
+    pub pubkey: String,
+    pub address: String,
+    pub amount: u64,
+    pub confirmations: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -112,6 +133,42 @@ impl Node {
             }
         }
     }
+
+    pub async fn next_address(&self) -> Result<String> {
+        match &self.client {
+            NodeClient::Lnd(client) => {
+                let addr = client.new_address().await?;
+                Ok(addr.address)
+            }
+            _ => {
+                panic!("We only support LND nodes at this time.")
+            }
+        }
+    }
+
+    pub async fn list_utxos(&self) -> Result<ClusterUtxos> {
+        match &self.client {
+            NodeClient::Lnd(client) => {
+                let utxos = client.list_unspent().await?;
+                let cluster_utxos = ClusterUtxos {
+                    utxos: utxos
+                        .utxos
+                        .into_iter()
+                        .map(|utxo| ClusterUtxo {
+                            pubkey: self.pubkey.clone(),
+                            address: utxo.address,
+                            amount: utxo.amount_sat.parse::<u64>().unwrap(),
+                            confirmations: utxo.confirmations.parse::<u64>().unwrap(),
+                        })
+                        .collect(),
+                };
+                Ok(cluster_utxos)
+            }
+            _ => {
+                panic!("We only support LND nodes at this time.")
+            }
+        }
+    }
 }
 
 impl Cluster {
@@ -120,10 +177,19 @@ impl Cluster {
             .time_to_live(Duration::from_secs(3))
             .build();
 
+        let address_cache: Cache<String, String> = Cache::builder()
+            .build();
+
+        let utxo_cache: Cache<String, ClusterUtxos> = Cache::builder()
+            .time_to_live(Duration::from_secs(5))
+            .build();
+
         Self {
             nodes,
             next_node_index: 0,
             invoice_cache,
+            address_cache,
+            utxo_cache,
         }
     }
 
@@ -212,40 +278,137 @@ impl Cluster {
         }
     }
 
-    // pub async fn pay_invoice(
-    //     &self, 
-    //     amount: u64, 
-    //     payment_request: String, 
-    //     pubkey: Option<String>) -> Result<ClusterPayPaymentRequestRes> {
+    pub async fn next_address(&self, pubkey: Option<String>) -> Result<String> {
+        match pubkey {
+            Some(pubkey) => {
+                let node = self
+                    .nodes
+                    .iter()
+                    .find(|node| node.pubkey == pubkey)
+                    .unwrap();
+                
+                let addr = node.next_address().await?;
+
+                self.address_cache.insert(addr.clone(), pubkey).await;
+                Ok(addr)
+            }
+            None => {
+                let mut rng = rand::thread_rng();
+                let node = self.nodes.choose(&mut rng).unwrap();
+                
+                let addr = node.next_address().await?;
+
+                self.address_cache.insert(addr.clone(), node.clone().pubkey).await;
+                Ok(addr)
+            }
+        }
+    } 
+
+    pub async fn list_utxos(&self, pubkey: Option<&str>) -> Result<ClusterUtxos> {
+        match pubkey {
+            Some(pubkey) => {
+                let node = self
+                    .nodes
+                    .iter()
+                    .find(|node| node.pubkey == pubkey)
+                    .ok_or_else(|| anyhow::anyhow!("Node not found with provided pubkey"))?;
+    
+                let cached_utxos = self.utxo_cache.get(&pubkey.to_string());
+    
+                match cached_utxos {
+                    Some(utxos) => Ok(utxos),
+                    None => {
+                        let utxos = node.list_utxos().await?;
+                        self.utxo_cache.insert(pubkey.to_string(), utxos.clone()).await;
+                        Ok(utxos)
+                    }
+                }
+            },
+            None => {
+                let mut cluster_utxos = ClusterUtxos {
+                    utxos: vec![]
+                };
+    
+                for node in &self.nodes {
+                    let cached_utxos = self.utxo_cache.get(&node.pubkey.to_string());
+                    
+                    let node_utxos = match cached_utxos {
+                        Some(utxos) => utxos,
+                        None => {
+                            let fetched_utxos = node.list_utxos().await?;
+                            self.utxo_cache.insert(node.pubkey.to_string(), fetched_utxos.clone()).await;
+                            fetched_utxos
+                        }
+                    };
+                    
+                    cluster_utxos.utxos.extend(node_utxos.utxos);
+                }
+    
+                Ok(cluster_utxos)
+            }
+        }
+    }
+    
+
+    pub async fn pay_invoice(
+        &self, 
+        amount: u64, 
+        payment_request: String, 
+        max_fee: i64,
+        pubkey: Option<String>) -> Result<ClusterPayPaymentRequestRes> {
         
-    //     // node selected
-    //     if pubkey.is_some() {
-    //         let node = self
-    //             .nodes
-    //             .iter()
-    //             .find(|node| node.pubkey == pubkey.unwrap())
-    //             .unwrap();
-    //         match &node.client {
-    //             NodeClient::Lnd(client) => {
-    //                 let req = LndSendPaymentSyncReq {
-    //                     payment_request: payment_request.clone(),
-    //                     amt: amount.to_string(),
-    //                     fee_limit: FeeLimit {
-    //                         fixed: String::from("0"),
-    //                     },
-    //                     allow_self_payment: false,
-    //                 };
-    //                 let invoice = client.send_payment_sync(req).await?;
-    //                 Ok(invoice.to_cluster())
-    //             }
-    //             _ => {
-    //                 panic!("We only support LND nodes at this time.")
-    //             }
-    //         }
-    //     } else {
-    //         // no node selected
-    //     }
-    // }
+        // node selected
+        if pubkey.is_some() {
+            let node = self
+                .nodes
+                .iter()
+                .find(|node| &node.pubkey == pubkey.as_ref().unwrap())
+                .ok_or_else(|| anyhow::anyhow!("Node not found with provided pubkey"))?;
+
+            match &node.client {
+                NodeClient::Lnd(client) => {
+                    let req = LndSendPaymentSyncReq {
+                        payment_request: payment_request.clone(),
+                        amt: amount.to_string(),
+                        fee_limit: FeeLimit {
+                            fixed: max_fee.to_string(),
+                        },
+                        allow_self_payment: false,
+                    };
+                    let invoice = client.send_payment_sync(req).await?;
+                    eprintln!("{:?}", invoice);
+                    Ok(invoice.to_cluster(node.clone().pubkey))
+                }
+                _ => {
+                    panic!("We only support LND nodes at this time.")
+                }
+            }
+        } else {
+            // no node selected, select a node at random
+            let mut rng = rand::thread_rng();
+            let node = self.nodes.choose(&mut rng).unwrap();
+
+            match &node.client {
+                NodeClient::Lnd(client) => {
+                    let req = LndSendPaymentSyncReq {
+                        payment_request: payment_request.clone(),
+                        amt: amount.to_string(),
+                        fee_limit: FeeLimit {
+                            fixed: max_fee.to_string(),
+                        },
+                        allow_self_payment: false,
+                    };
+                    let invoice = client.send_payment_sync(req).await?;
+                    Ok(invoice.to_cluster(node.clone().pubkey))
+                }
+                _ => {
+                    panic!("We only support LND nodes at this time.")
+                }
+            }
+
+
+        }
+    }
 
 }
 
