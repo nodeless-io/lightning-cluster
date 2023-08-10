@@ -1,5 +1,8 @@
 mod tests {
-    use lightning_cluster::{cluster::{Node, NodeNetwork, NodeLightningImpl, NodeClient, ClusterAddInvoice, Cluster}, lnd::LndClient};
+    use lightning_cluster::{
+        cluster::{Cluster, ClusterAddInvoice, Node, NodeClient, NodeLightningImpl, NodeNetwork},
+        lnd::LndClient,
+    };
 
     #[tokio::test]
     async fn test_lightning_cluster() {
@@ -16,8 +19,11 @@ mod tests {
             )),
         };
 
+        let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+        let con = client.get_async_connection().await.unwrap();
+
         let nodes = vec![node1];
-        let cluster = Cluster::new(nodes);
+        let mut cluster = Cluster::new(nodes, con, 1, 3600, 3600);
 
         let req = ClusterAddInvoice {
             pubkey: None,
@@ -29,7 +35,11 @@ mod tests {
         let invoice = cluster.add_invoice(req, None).await.unwrap();
         let get_invoice = cluster.lookup_invoice(&invoice.r_hash, None).await.unwrap();
 
-        println!("{:?}", get_invoice);
+        println!("first get: {:?}", get_invoice);
+
+        let get_invoice = cluster.lookup_invoice(&invoice.r_hash, None).await.unwrap();
+
+        println!("2nd get from cache: {:?}", get_invoice); // from cache
 
         let next_addr = cluster.next_address(None).await.unwrap();
 
@@ -43,7 +53,10 @@ mod tests {
 
         let payment_request = String::from("lntb10u1pjva6sepp5lqz5lysxd7vu7h3nqzj3lem544uqmvec5k53cp2msm2lvnw0s9zqdqqcqzzsxqr23ssp5dysff7u8n2w7f0x5gysmlze7zw3fg05f2e2q24tzh8vanfnt5nss9qyyssqtcashms9q6dmt4ywja8jrtkztzr5kr5k24wa8mdxs00fgxq76d9zvs6styvhuxc5pvdcrs4m89r4rmvkp6lvc7tr959cds7na7k63vcplqfzxx");
 
-        let _ = cluster.pay_invoice(1000, payment_request, 100, None).await.unwrap();
+        let _ = cluster
+            .pay_invoice(1000, payment_request, 100, None)
+            .await
+            .unwrap();
 
         //println!("{:?}", pay_ln_invoice);
     }

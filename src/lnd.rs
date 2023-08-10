@@ -1,10 +1,10 @@
+use crate::cluster::{self, ClusterAddInvoice, ClusterUtxo, ClusterUtxos};
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::Response;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Read;
-use crate::cluster::{self, ClusterAddInvoice, ClusterUtxos, ClusterUtxo};
 
 #[derive(Clone)]
 pub struct LndClient {
@@ -45,9 +45,7 @@ impl ListUnspentResponse {
             utxos.push(utxo.to_cluster(pubkey.clone())?);
         }
 
-        Ok(ClusterUtxos {
-            utxos: utxos,
-        })
+        Ok(ClusterUtxos { utxos: utxos })
     }
 }
 
@@ -247,7 +245,10 @@ impl LndClient {
             .context("Failed to parse JSON response from LND API")
     }
 
-    pub async fn send_payment_sync(&self, req: LndSendPaymentSyncReq) -> Result<LndSendPaymentSyncRes> {
+    pub async fn send_payment_sync(
+        &self,
+        req: LndSendPaymentSyncReq,
+    ) -> Result<LndSendPaymentSyncRes> {
         let url = format!("{}/v1/channels/transactions", self.host);
         let res = LndClient::post(&self, &url, &req).await.unwrap();
 
@@ -261,15 +262,15 @@ impl LndClient {
             serde_json::Value::Null => None,
             serde_json::Value::String(s) if s.is_empty() => None,
             serde_json::Value::String(s) => Some(to_hex(&s)?),
-            _ => None, 
+            _ => None,
         };
-        
+
         let payment_error = match &json["payment_error"] {
             serde_json::Value::Null => None,
             serde_json::Value::String(s) if s.is_empty() => None,
             serde_json::Value::String(s) => Some(s.clone()),
-            _ => None, 
-            };
+            _ => None,
+        };
 
         let payment_route = match &json["payment_route"] {
             serde_json::Value::Null => None,
@@ -304,7 +305,7 @@ impl LndClient {
 
         let req = ListUnspentRequest {
             min_confs: 0,
-            max_confs: 500,
+            max_confs: 50000,
             account: None,
             unconfirmed_only: None,
         };
@@ -348,11 +349,7 @@ impl LndClient {
         Ok(resp)
     }
 
-    async fn post<T: serde::Serialize>(
-        &self,
-        url: &str,
-        body: &T,
-    ) -> Result<Response> {
+    async fn post<T: serde::Serialize>(&self, url: &str, body: &T) -> Result<Response> {
         let mut macaroon_data = Vec::new();
         let mut macaroon_file = fs::File::open(&self.macaroon_path).unwrap();
         macaroon_file.read_to_end(&mut macaroon_data).unwrap();
@@ -392,7 +389,7 @@ pub fn to_hex(str: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::lnd::{LndClient, LndSendPaymentSyncReq, FeeLimit};
+    use crate::lnd::{FeeLimit, LndClient, LndSendPaymentSyncReq};
 
     #[tokio::test]
     async fn test_send_payment_sync() {
@@ -413,7 +410,7 @@ mod tests {
             },
             allow_self_payment: true,
         };
-        
+
         let payment = client.send_payment_sync(payment_req).await;
 
         eprintln!("{:?}", payment);

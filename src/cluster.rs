@@ -1,18 +1,20 @@
-use crate::lnd::{AddInvoiceResponse, LndClient, LndSendPaymentSyncReq, FeeLimit};
+use crate::lnd::Route;
+use crate::lnd::{AddInvoiceResponse, FeeLimit, LndClient, LndSendPaymentSyncReq};
 use anyhow::Result;
+use redis::aio::Connection;
 use core::fmt;
-use moka::future::Cache;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
-use std::{fmt::Display, time::Duration};
-use crate::lnd::Route;
+use std::fmt::Display;
+extern crate redis;
+use redis::{AsyncCommands, FromRedisValue};
 
 pub struct Cluster {
     pub nodes: Vec<Node>,
-    pub next_node_index: usize,
-    pub invoice_cache: Cache<String, ClusterLookupInvoice>,
-    pub address_cache: Cache<String, String>,
-    pub utxo_cache: Cache<String, ClusterUtxos>,
+    pub cache: Connection,
+    pub inv_exp_sec: i64,
+    pub addr_exp_sec: i64,
+    pub utxo_exp_sec: i64,
 }
 
 #[derive(Clone)]
@@ -69,6 +71,34 @@ pub struct ClusterLookupInvoice {
     pub state: ClusterInvoiceState,
 }
 
+impl FromRedisValue for ClusterLookupInvoice {
+    fn from_redis_value(v: &redis::Value) -> redis::RedisResult<Self> {
+        match v {
+            redis::Value::Okay => {
+                return Ok(ClusterLookupInvoice {
+                    pubkey: "".to_string(),
+                    memo: "".to_string(),
+                    r_preimage: "".to_string(),
+                    r_hash: "".to_string(),
+                    value: "".to_string(),
+                    settle_date: "".to_string(),
+                    payment_request: "".to_string(),
+                    description_hash: "".to_string(),
+                    expiry: "".to_string(),
+                    amt_paid_sat: "".to_string(),
+                    state: ClusterInvoiceState::Open,
+                })
+            },
+            redis::Value::Data(data) => {
+                let json = String::from_utf8(data.to_vec()).unwrap();
+                let invoice: ClusterLookupInvoice = serde_json::from_str(&json).unwrap();
+                return Ok(invoice)
+            },
+            _ => panic!("Invalid redis value"),
+        };
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ClusterPayPaymentRequestRes {
     pub pubkey: String,
@@ -78,12 +108,30 @@ pub struct ClusterPayPaymentRequestRes {
     pub payment_hash: Option<String>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, Serialize)]
 pub struct ClusterUtxos {
     pub utxos: Vec<ClusterUtxo>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+impl FromRedisValue for ClusterUtxos {
+    fn from_redis_value(v: &redis::Value) -> redis::RedisResult<Self> {
+        match v {
+            redis::Value::Okay => {
+                return Ok(ClusterUtxos {
+                    utxos: vec![],
+                })
+            },
+            redis::Value::Data(data) => {
+                let json = String::from_utf8(data.to_vec()).unwrap();
+                let utxos: ClusterUtxos = serde_json::from_str(&json).unwrap();
+                return Ok(utxos)
+            },
+            _ => panic!("Invalid redis value"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ClusterUtxo {
     pub pubkey: String,
     pub address: String,
@@ -121,12 +169,12 @@ impl Node {
             NodeClient::Lnd(client) => {
                 let invoice = client.add_invoice(req).await?;
 
-                        let response = AddInvoiceResponse {
-                            r_hash: to_hex(&invoice.r_hash)?,
-                            payment_addr: to_hex(&invoice.payment_addr)?,
-                            ..invoice
-                        };
-                        Ok(response)
+                let response = AddInvoiceResponse {
+                    r_hash: to_hex(&invoice.r_hash)?,
+                    payment_addr: to_hex(&invoice.payment_addr)?,
+                    ..invoice
+                };
+                Ok(response)
             }
             _ => {
                 panic!("We only support LND nodes at this time.")
@@ -172,36 +220,34 @@ impl Node {
 }
 
 impl Cluster {
-    pub fn new(nodes: Vec<Node>) -> Cluster {
-        let invoice_cache: Cache<String, ClusterLookupInvoice> = Cache::builder()
-            .time_to_live(Duration::from_secs(3))
-            .build();
-
-        let address_cache: Cache<String, String> = Cache::builder()
-            .build();
-
-        let utxo_cache: Cache<String, ClusterUtxos> = Cache::builder()
-            .time_to_live(Duration::from_secs(5))
-            .build();
-
+    pub fn new(
+        nodes: Vec<Node>,
+        redis: redis::aio::Connection,
+        inv_exp_sec: i64,
+        addr_exp_sec: i64,
+        utxo_exp_sec: i64,
+    ) -> Cluster {
         Self {
             nodes,
-            next_node_index: 0,
-            invoice_cache,
-            address_cache,
-            utxo_cache,
+            cache: redis,
+            inv_exp_sec: inv_exp_sec,
+            addr_exp_sec: addr_exp_sec,
+            utxo_exp_sec: utxo_exp_sec,
         }
     }
 
     pub async fn lookup_invoice(
-        &self,
+        &mut self,
         r_hash: &str,
         pubkey: Option<String>,
     ) -> Result<ClusterLookupInvoice> {
-        let cached_invoice = self.invoice_cache.get(&r_hash.to_string());
+        let cached_invoice = self.cache.get(&r_hash.to_string()).await?;
 
         match cached_invoice {
-            Some(invoice) => Ok(invoice),
+            Some(invoice) => {
+                eprintln!("cached");
+                Ok(invoice)
+            },
             None => {
                 if let Some(pubkey) = pubkey {
                     let node = self
@@ -215,9 +261,15 @@ impl Cluster {
                         r_preimage: to_hex(&invoice.r_preimage)?,
                         ..invoice
                     };
-                    self.invoice_cache
-                        .insert(r_hash.to_string(), hexed_invoice.clone())
-                        .await;
+                    let json_string = serde_json::to_string(&hexed_invoice).unwrap();
+
+                    let _: Result<ClusterLookupInvoice, _> = self.cache
+                        .set_ex(
+                            r_hash.to_string(),
+                            json_string,
+                            self.inv_exp_sec as usize,
+                        ).await;
+                        eprintln!("requested invoice from node");
                     Ok(hexed_invoice)
                 } else {
                     // Make calls to all nodes to find who owns the invoice
@@ -245,10 +297,18 @@ impl Cluster {
                         ..success_result.clone()
                     };
 
+                    let json_invoice = serde_json::to_string(&hexed_invoice).unwrap();
+
                     // Insert the successful result into the cache
-                    self.invoice_cache
-                        .insert(r_hash.to_string(), hexed_invoice.clone())
+                    let _: Result<ClusterLookupInvoice, _> = self.cache
+                        .set_ex(
+                            r_hash.to_string(),
+                            json_invoice,
+                            self.inv_exp_sec as usize,
+                        )
                         .await;
+
+                        eprintln!("requested invoice from node");
 
                     Ok(hexed_invoice)
                 }
@@ -278,7 +338,7 @@ impl Cluster {
         }
     }
 
-    pub async fn next_address(&self, pubkey: Option<String>) -> Result<String> {
+    pub async fn next_address(&mut self, pubkey: Option<String>) -> Result<String> {
         match pubkey {
             Some(pubkey) => {
                 let node = self
@@ -286,25 +346,35 @@ impl Cluster {
                     .iter()
                     .find(|node| node.pubkey == pubkey)
                     .unwrap();
-                
+
                 let addr = node.next_address().await?;
 
-                self.address_cache.insert(addr.clone(), pubkey).await;
+                let _: Result<String, _> = self.cache
+                    .set_ex(
+                        addr.clone(),
+                        node.clone().pubkey,
+                        self.addr_exp_sec as usize,
+                    )
+                    .await;
                 Ok(addr)
             }
             None => {
                 let mut rng = rand::thread_rng();
                 let node = self.nodes.choose(&mut rng).unwrap();
-                
+
                 let addr = node.next_address().await?;
 
-                self.address_cache.insert(addr.clone(), node.clone().pubkey).await;
+                let _: Result<String, _> = self.cache.set_ex(
+                    addr.clone(),
+                    node.clone().pubkey,
+                    self.addr_exp_sec as usize,
+                ).await;
                 Ok(addr)
             }
         }
-    } 
+    }
 
-    pub async fn list_utxos(&self, pubkey: Option<&str>) -> Result<ClusterUtxos> {
+    pub async fn list_utxos(&mut self, pubkey: Option<&str>) -> Result<ClusterUtxos> {
         match pubkey {
             Some(pubkey) => {
                 let node = self
@@ -312,51 +382,60 @@ impl Cluster {
                     .iter()
                     .find(|node| node.pubkey == pubkey)
                     .ok_or_else(|| anyhow::anyhow!("Node not found with provided pubkey"))?;
-    
-                let cached_utxos = self.utxo_cache.get(&pubkey.to_string());
-    
+
+                let cache_key = format!("utxos:{}", node.pubkey);
+                let cached_utxos = self.cache.get(&cache_key).await?;
+
                 match cached_utxos {
                     Some(utxos) => Ok(utxos),
                     None => {
                         let utxos = node.list_utxos().await?;
-                        self.utxo_cache.insert(pubkey.to_string(), utxos.clone()).await;
+                        let json_utxos = serde_json::to_string(&utxos).unwrap();
+                        let _: Result<ClusterUtxos, _> = self.cache.set_ex(
+                            cache_key,
+                            json_utxos,
+                            self.utxo_exp_sec as usize,
+                        ).await;
                         Ok(utxos)
                     }
                 }
-            },
+            }
             None => {
-                let mut cluster_utxos = ClusterUtxos {
-                    utxos: vec![]
-                };
-    
+                let mut cluster_utxos = ClusterUtxos { utxos: vec![] };
+
                 for node in &self.nodes {
-                    let cached_utxos = self.utxo_cache.get(&node.pubkey.to_string());
-                    
+                    let cache_key = format!("utxos:{}", node.pubkey);
+                    let cached_utxos = self.cache.get(&cache_key).await?;
+
                     let node_utxos = match cached_utxos {
                         Some(utxos) => utxos,
                         None => {
                             let fetched_utxos = node.list_utxos().await?;
-                            self.utxo_cache.insert(node.pubkey.to_string(), fetched_utxos.clone()).await;
+                            let json_utxos = serde_json::to_string(&fetched_utxos).unwrap();
+                            let _: Result<ClusterUtxos, _> = self.cache.set_ex(
+                                cache_key,
+                                json_utxos,
+                                self.utxo_exp_sec as usize,
+                            ).await;
                             fetched_utxos
                         }
                     };
-                    
+
                     cluster_utxos.utxos.extend(node_utxos.utxos);
                 }
-    
+
                 Ok(cluster_utxos)
             }
         }
     }
-    
 
     pub async fn pay_invoice(
-        &self, 
-        amount: u64, 
-        payment_request: String, 
+        &self,
+        amount: u64,
+        payment_request: String,
         max_fee: i64,
-        pubkey: Option<String>) -> Result<ClusterPayPaymentRequestRes> {
-        
+        pubkey: Option<String>,
+    ) -> Result<ClusterPayPaymentRequestRes> {
         // node selected
         if pubkey.is_some() {
             let node = self
@@ -405,11 +484,8 @@ impl Cluster {
                     panic!("We only support LND nodes at this time.")
                 }
             }
-
-
         }
     }
-
 }
 
 impl Node {
@@ -452,12 +528,11 @@ pub fn to_hex(str: &str) -> Result<String> {
 pub mod tests {
     use crate::lnd::LndClient;
 
-    use super::{Cluster, Node, NodeNetwork, NodeLightningImpl, NodeClient, ClusterAddInvoice};
-
+    use super::{Cluster, ClusterAddInvoice, Node, NodeClient, NodeLightningImpl, NodeNetwork};
 
     #[tokio::test]
     async fn test_add_lookup_invoice() {
-        let cluster = create_test_cluster();
+        let mut cluster = create_test_cluster().await;
         let add_invoice = ClusterAddInvoice {
             pubkey: None,
             memo: String::from("test"),
@@ -474,7 +549,7 @@ pub mod tests {
         assert_eq!(lookup_invoice.r_hash, invoice.r_hash);
     }
 
-    pub fn create_test_cluster() -> Cluster {
+    pub async fn create_test_cluster() -> Cluster {
         let node1 = Node {
             pubkey: dotenvy::var("NODE1_PUBKEY").unwrap(),
             ip: dotenvy::var("NODE1_IP").unwrap(),
@@ -487,9 +562,10 @@ pub mod tests {
                 dotenvy::var("NODE1_MACAROON_PATH").unwrap(),
             )),
         };
-    
+
         let nodes = vec![node1];
-        let cluster = Cluster::new(nodes);
+        let redis = redis::Client::open("redis://127.0.01/").unwrap().get_async_connection().await.unwrap();
+        let cluster = Cluster::new(nodes, redis, 60, 60, 60);
 
         cluster
     }
